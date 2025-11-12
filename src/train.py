@@ -1,24 +1,20 @@
 import argparse
 import json
 import logging
-import math
 import os
-import sys
-from typing import Any, Dict, List
 
 import datasets
-from datasets import Dataset
 import torch
 import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
-from torch.optim.lr_scheduler import ReduceLROnPlateau
-from torch.utils.data import DataLoader
+from datasets import Dataset
 from tqdm.auto import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer, default_data_collator
-from transformers import EarlyStoppingCallback
-from eval import judge, initialize_models
+from transformers import AutoModelForCausalLM, AutoTokenizer, EarlyStoppingCallback
+from trl import DPOConfig, DPOTrainer
+
+from eval import initialize_models, judge, move_model_to_host, move_model_to_device
 from utils import (
     get_dataset,
     get_next_run_dir,
@@ -26,8 +22,6 @@ from utils import (
     load_config,
     sanitize_config,
 )
-
-from trl import DPOConfig, DPOTrainer
 
 REWRITE_MODEL = "models/rewrite"
 SAFETY_MODEL = "models/guard"
@@ -116,6 +110,7 @@ def rewrite(raw_dataset, model, tokenizer):
     preference["rejected"] = []
     score = 0
     print("*** Judging Output ***")
+    move_model_to_device()
     for i in tqdm(range(n)):
         result = []
         for j in range(8):
@@ -141,7 +136,7 @@ def rewrite(raw_dataset, model, tokenizer):
                     preference["prompt"].append(raw_dataset["instruction"][i])
                     preference["chosen"].append(outputs[i * 8 + j])
                     preference["rejected"].append(outputs[i * 8 + k])
-
+    move_model_to_host()
     return preference, score / (8 * n)
 
 
@@ -161,13 +156,14 @@ def main(args):
         tokenizer.bos_token_id = tokenizer.eos_token_id
 
     model = AutoModelForCausalLM.from_pretrained(REWRITE_MODEL, dtype=torch.bfloat16)
-    initialize_models(SAFETY_MODEL, USEFULNESS_MODEL, CHAT_MODEL)
-
+    if accelerator.is_main_process:
+        initialize_models(SAFETY_MODEL, USEFULNESS_MODEL, CHAT_MODEL)
+    accelerator.wait_for_everyone()
     model = accelerator.prepare(model)
 
     raw_dataset = get_dataset(args["data"])["train"]
     if train_args["debug"]:
-        raw_dataset = raw_dataset.select(range(10))
+        raw_dataset = raw_dataset.select(range(5))
 
     n = len(raw_dataset["prompt"])
     prompts = []
@@ -178,8 +174,22 @@ def main(args):
     scores = []
     patience = 0
     for it in range(train_args["iteration"]):
-        rewrite_dataset, score = rewrite(raw_dataset, model, tokenizer)
-        model = train(model, tokenizer, rewrite_dataset, accelerator, args, it)
+        if accelerator.is_main_process:
+            rewrite_dataset, score = rewrite(
+                raw_dataset, accelerator.unwrap_model(model), tokenizer
+            )
+            with open("data/tmp.json", "w", encoding="utf-8") as f:
+                json.dump(rewrite_dataset, f, ensure_ascii=False, indent=4)
+            tokenizer.save_pretrained(train_args["output_dir"])
+            logger.info(json.dumps({"average score": score}, indent=4))
+            with open(
+                os.path.join(train_args["output_dir"], "all_result.json"),
+                "a",
+            ) as f:
+                json.dump({"average score": score}, f, indent=4)
+        accelerator.wait_for_everyone()
+
+        model = train(accelerator.unwrap_model(model), tokenizer, accelerator, args, it)
 
         if len(scores) != 0 and score < max(scores):
             patience += 1
@@ -188,7 +198,7 @@ def main(args):
             unwrapped_model = accelerator.unwrap_model(model)
             state_dict = {
                 k: v.contiguous() if isinstance(v, torch.Tensor) else v
-                for k, v in unwrapped_model.state_dict().items()
+                for k, v in model.state_dict().items()
             }
             unwrapped_model.save_pretrained(
                 train_args["output_dir"],
@@ -196,30 +206,20 @@ def main(args):
                 is_main_process=accelerator.is_main_process,
                 save_function=accelerator.save,
             )
-            if accelerator.is_main_process:
-                tokenizer.save_pretrained(train_args["output_dir"])
-                logger.info(json.dumps({"average score": score}, indent=4))
-                with open(
-                    os.path.join(train_args["output_dir"], "all_result.json"),
-                    "a",
-                ) as f:
-                    json.dump({"average score": score}, f, indent=4)
+
         if patience >= train_args["patience"]:
             break
 
 
-def train(model, tokenizer, rewrites, accelerator, args, it):
+def train(model, tokenizer, accelerator, args, it):
     data_args = args["data"]
     train_args = args["train"]
-    # # setup optimizer and lr scheduler
-    # adapter_params = [p for p in model.parameters() if p.requires_grad]
-    # optimizer = torch.optim.AdamW(adapter_params, lr=train_args["learning_rate"])
-    # lr_scheduler = ReduceLROnPlateau(
-    #     optimizer,
-    #     mode="max",
-    #     factor=0.3,
-    #     patience=train_args["patience"] // 2,
-    # )
+
+    with open("data/tmp.json", "r", encoding="utf-8") as f:
+        rewrite = json.load(f)
+    rewrite_dataset = Dataset.from_dict(rewrite).train_test_split(test_size=0.1)
+    train_dataset = rewrite_dataset["train"]
+    test_dataset = rewrite_dataset["test"]
 
     experiment_config = sanitize_config(args)
     accelerator.init_trackers(
@@ -244,9 +244,6 @@ def train(model, tokenizer, rewrites, accelerator, args, it):
         load_best_model_at_end=True,
     )
     callbacks = [EarlyStoppingCallback(early_stopping_patience=train_args["patience"])]
-    data = Dataset.from_dict(rewrites).train_test.split(test_size=0.1)
-    train_dataset = data["train"]
-    test_dataset = data["test"]
     trainer = DPOTrainer(
         model=model,
         args=dpo_args,
@@ -257,6 +254,7 @@ def train(model, tokenizer, rewrites, accelerator, args, it):
     )
 
     trainer.train()
+    return trainer.model
 
 
 if __name__ == "__main__":
