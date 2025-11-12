@@ -1,0 +1,19 @@
+{
+  "data": {
+    "file": "data/data.parquet",
+    "batch_size": 16
+  },
+  "train": {
+    "iteration": 1,
+    "epochs": 1,
+    "learning_rate": 0.0005,
+    "check_val_every_n_step": 10,
+    "early_stopping": true,
+    "patience": 10,
+    "output_dir": "checkpoints/",
+    "logs_dir": "logs/",
+    "debug": true,
+    "gradient_accumulation_steps": 25
+  },
+  "seed": 42
+}
