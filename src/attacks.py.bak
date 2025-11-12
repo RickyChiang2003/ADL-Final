@@ -1,0 +1,346 @@
+"""
+Universal Soft-Prefix Trigger Attack
+======================================
+Optimizes a learnable soft-prefix (continuous embeddings) that can be prepended to prompts
+to manipulate safety classification while preserving relevance (transferability).
+
+Key idea:
+  1. Initialize a soft-prefix of N tokens as learnable embeddings.
+  2. On a small set of source prompts, optimize prefix to minimize safety_score (maximize attack success).
+  3. Use gradient-based optimization (PGD-like) in embedding space.
+  4. Save the learned prefix and apply to unseen prompts at inference time.
+  5. Regularize to preserve semantic similarity (keep relevance_score high).
+"""
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.nn.utils import clip_grad_norm_
+from typing import List, Tuple, Optional, Dict
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import json
+from pathlib import Path
+
+
+class SoftPrefixTrigger(nn.Module):
+    """
+    Learnable soft-prefix module.
+    Initializes as random normal embeddings and can be prepended to input embeddings.
+    """
+    def __init__(self, prefix_length: int, embedding_dim: int):
+        super().__init__()
+        self.prefix_length = prefix_length
+        self.embedding_dim = embedding_dim
+        # Initialize soft prefix as learnable embeddings
+        self.prefix = nn.Parameter(torch.randn(prefix_length, embedding_dim) * 0.01)
+    
+    def forward(self, batch_embeds):
+        """
+        Args:
+            batch_embeds: (batch_size, seq_len, embedding_dim)
+        Returns:
+            (batch_size, prefix_length + seq_len, embedding_dim)
+        """
+        batch_size = batch_embeds.size(0)
+        # Expand prefix for batch
+        prefix_expanded = self.prefix.unsqueeze(0).expand(batch_size, -1, -1)
+        # Concatenate prefix with input embeddings
+        return torch.cat([prefix_expanded, batch_embeds], dim=1)
+
+
+def get_embedding_module(model):
+    """Extract embedding layer from HF model."""
+    if hasattr(model, 'get_input_embeddings'):
+        return model.get_input_embeddings()
+    elif hasattr(model, 'embedding'):
+        return model.embedding
+    elif hasattr(model, 'embed_tokens'):
+        return model.embed_tokens
+    else:
+        # Fallback: try common names
+        for name in ['embeddings', 'word_embeddings', 'embedding']:
+            if hasattr(model, name):
+                return getattr(model, name)
+    raise ValueError("Could not find embedding module in model")
+
+
+def get_embedding_dim(model) -> int:
+    """Extract embedding dimension from model config or embedding layer."""
+    # Try to get from model config first
+    if hasattr(model, 'config') and hasattr(model.config, 'hidden_size'):
+        return model.config.hidden_size
+    
+    # Fall back to embedding weight shape
+    try:
+        embed_module = get_embedding_module(model)
+        if hasattr(embed_module, 'embedding_dim'):
+            return embed_module.embedding_dim
+        elif hasattr(embed_module, 'weight'):
+            return embed_module.weight.shape[-1]
+    except:
+        pass
+    
+    raise ValueError("Could not determine embedding dimension from model")
+
+
+def compute_safety_loss(model, input_ids: torch.Tensor, device: str) -> torch.Tensor:
+    """
+    Compute a surrogate loss that reflects safety classification.
+    Here, we use the model's generated output to predict if prompt is unsafe.
+    
+    Simple approach: if model generates tokens associated with "unsafe" category,
+    the loss is high. For now, we use a simple heuristic on logits.
+    """
+    with torch.no_grad():
+        outputs = model(input_ids, return_dict=True)
+    
+    # Heuristic: use the last token's logits as a proxy for safety decision
+    logits = outputs.logits[:, -1, :]  # (batch_size, vocab_size)
+    
+    # Find tokens commonly associated with "unsafe" responses
+    # This is a simplification; a better approach would use the guard model directly
+    # For now, maximize output entropy as a proxy for "confusing" the model
+    probs = torch.softmax(logits, dim=-1)
+    entropy = -(probs * (torch.log(probs) + 1e-10)).sum(dim=-1).mean()
+    
+    # Loss: minimize entropy means model is confident; maximize means confused
+    # We want to maximize entropy to confuse the safety classifier
+    loss = -entropy  # Negative because we want to maximize entropy
+    return loss
+
+
+
+
+
+    model,
+    tokenizer,
+    guard_model,
+    guard_tokenizer,
+    source_prompts: List[str],
+    prefix_length: int = 10,
+    num_steps: int = 50,
+    learning_rate: float = 0.01,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    semantic_weight: float = 0.1,
+    verbose: bool = True
+) -> Tuple[torch.Tensor, Dict]:
+    """
+    Optimize a universal soft-prefix trigger on source prompts.
+    
+    Args:
+        model: The model to be attacked (e.g., Guard model or Chat model).
+        tokenizer: Tokenizer for the attacked model.
+        guard_model: The guard model to check safety (used to compute actual safety score).
+        guard_tokenizer: Tokenizer for guard model.
+        source_prompts: List of prompts to optimize on (usually 1-5 representative toxic prompts).
+        prefix_length: Length of soft prefix (default 10 tokens).
+        num_steps: Number of optimization steps (default 50).
+        learning_rate: Optimization learning rate.
+        device: Device to run on.
+        semantic_weight: Weight for semantic similarity regularization.
+        verbose: Print progress.
+    
+    Returns:
+        learned_prefix: (prefix_length, embedding_dim) tensor of learned soft embeddings.
+        history: Dict containing loss history and statistics.
+    """
+    # Initialize soft prefix
+    embedding_module = get_embedding_module(model)
+    embedding_dim = get_embedding_dim(model)
+    
+    soft_prefix = SoftPrefixTrigger(prefix_length, embedding_dim).to(device)
+    optimizer = optim.Adam(soft_prefix.parameters(), lr=learning_rate)
+    
+    model.eval()
+    guard_model.eval()
+    
+    history = {"losses": [], "safety_scores": []}
+    
+    for step in range(num_steps):
+        optimizer.zero_grad()
+        
+        batch_loss = 0.0
+        batch_safety = 0.0
+        
+        for prompt in source_prompts:
+            # Tokenize source prompt
+            inputs = tokenizer(
+                prompt,
+                return_tensors="pt",
+                max_length=256,
+                truncation=True,
+                padding=True
+            ).to(device)
+            
+            input_ids = inputs['input_ids']
+            attention_mask = inputs['attention_mask']
+            
+            # Get embeddings
+            with torch.no_grad():
+                embeds = embedding_module(input_ids)
+            
+            # Apply soft prefix
+            prefixed_embeds = soft_prefix(embeds)
+            
+            # Extend attention mask for prefix
+            batch_size = embeds.shape[0]
+            prefix_len = soft_prefix.prefix.shape[0]
+            prefix_attn = torch.ones(batch_size, prefix_len, device=device)
+            prefixed_attention_mask = torch.cat([prefix_attn, attention_mask], dim=1)
+            
+            # Forward pass through model with prefixed input (use embeddings directly)
+            # This allows gradients to flow through the soft prefix
+            model_outputs = model(
+                inputs_embeds=prefixed_embeds,
+                attention_mask=prefixed_attention_mask,
+                return_dict=True
+            )
+            
+            # Compute attack loss based on prefixed model output logits
+            logits = model_outputs.logits[:, -1, :]  # (batch_size, vocab_size)
+            probs = torch.softmax(logits, dim=-1)
+            entropy = -(probs * (torch.log(probs) + 1e-10)).sum(dim=-1).mean()
+            
+            # Loss: maximize entropy to confuse the safety classifier
+            attack_loss = -entropy  # Negative because we want to maximize entropy
+            
+            # Compute semantic regularization (keep prefix magnitude small)
+            semantic_loss = torch.tensor(0.0, device=device)
+            if semantic_weight > 0:
+                # Simple regularization: keep prefix magnitude small
+                semantic_loss = (soft_prefix.prefix ** 2).mean()
+            
+            total_loss = attack_loss + semantic_weight * semantic_loss
+            batch_loss += total_loss
+            
+            # Compute actual safety score for monitoring (on guard model)
+            with torch.no_grad():
+                guard_inputs = guard_tokenizer(
+                    prompt,
+                    return_tensors="pt",
+                    max_length=256,
+                    truncation=True
+                ).to(device)
+                guard_chat = [{"role": "user", "content": prompt}]
+                try:
+                    guard_input_ids = guard_tokenizer.apply_chat_template(
+                        guard_chat, return_tensors="pt"
+                    ).to(device)
+                except:
+                    guard_input_ids = guard_inputs['input_ids']
+                
+                guard_outputs = guard_model.generate(
+                    guard_input_ids,
+                    max_new_tokens=20,
+                    do_sample=False,
+                    pad_token_id=0
+                )
+                guard_response = guard_tokenizer.decode(
+                    guard_outputs[0][guard_input_ids.shape[-1]:],
+                    skip_special_tokens=True
+                ).strip().lower()
+                
+                # Parse safety decision
+                if 'unsafe' in guard_response:
+                    safety = 0.0
+                elif 'safe' in guard_response:
+                    safety = 1.0
+                elif 'controversial' in guard_response:
+                    safety = 0.5
+                else:
+                    safety = 0.5
+                
+                batch_safety += safety
+        
+        # Backward pass
+        total_batch_loss = batch_loss / len(source_prompts)
+        total_batch_loss.backward()
+        
+        # Gradient clipping
+        clip_grad_norm_(soft_prefix.parameters(), max_norm=1.0)
+        
+        optimizer.step()
+        
+        # Record history
+        history["losses"].append(total_batch_loss.item())
+        history["safety_scores"].append(batch_safety / len(source_prompts))
+        
+        if verbose and (step + 1) % 10 == 0:
+            print(
+                f"Step {step + 1}/{num_steps} | Loss: {total_batch_loss.item():.4f} | "
+                f"Avg Safety: {batch_safety / len(source_prompts):.4f}"
+            )
+    
+    return soft_prefix.prefix.detach().cpu(), history
+
+
+def apply_trigger(
+    prompt: str,
+    trigger_prefix: torch.Tensor,
+    tokenizer,
+    model,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    mode: str = "prepend"
+) -> str:
+    """
+    Apply learned soft-prefix trigger to a prompt at inference time.
+    
+    Strategy: Convert soft embeddings back to discrete tokens by finding nearest tokens.
+    
+    Args:
+        prompt: Input prompt.
+        trigger_prefix: (prefix_length, embedding_dim) tensor of learned soft embeddings.
+        tokenizer: Tokenizer.
+        model: Model (to access embeddings).
+        device: Device.
+        mode: "prepend" (add to beginning) or "append" (add to end).
+    
+    Returns:
+        Modified prompt string with discrete token approximation of trigger.
+    """
+    # Get embedding matrix
+    embedding_module = get_embedding_module(model)
+    embedding_matrix = embedding_module.weight  # (vocab_size, embedding_dim)
+    
+    # Find nearest tokens for each soft embedding
+    trigger_prefix = trigger_prefix.to(device)
+    embedding_matrix = embedding_matrix.to(device)
+    
+    # Compute cosine similarity to find nearest tokens
+    trigger_prefix_norm = torch.nn.functional.normalize(trigger_prefix, dim=-1)
+    embedding_matrix_norm = torch.nn.functional.normalize(embedding_matrix, dim=-1)
+    
+    similarities = torch.matmul(trigger_prefix_norm, embedding_matrix_norm.t())
+    nearest_token_ids = torch.argmax(similarities, dim=-1)
+    
+    # Decode to get trigger string
+    trigger_tokens = nearest_token_ids.cpu().tolist()
+    trigger_str = tokenizer.decode(trigger_tokens, skip_special_tokens=False).strip()
+    
+    # Combine with original prompt
+    if mode == "prepend":
+        return trigger_str + " " + prompt
+    elif mode == "append":
+        return prompt + " " + trigger_str
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+
+
+def save_trigger(trigger_prefix: torch.Tensor, save_path: str):
+    """Save learned trigger to disk."""
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(trigger_prefix, save_path)
+    print(f"Trigger saved to {save_path}")
+
+
+def load_trigger(load_path: str) -> Optional[torch.Tensor]:
+    """Load learned trigger from disk."""
+    load_path = Path(load_path)
+    if load_path.exists():
+        trigger = torch.load(load_path)
+        print(f"Trigger loaded from {load_path}")
+        return trigger
+    else:
+        print(f"Trigger file not found at {load_path}")
+        return None
