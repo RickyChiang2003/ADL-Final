@@ -7,6 +7,7 @@ import datasets
 import torch
 import transformers
 from accelerate import Accelerator
+from accelerate.utils import gather_object
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
 from datasets import Dataset
@@ -71,7 +72,7 @@ def accelerator_setup(train_args, isTest):
     return accelerator
 
 
-def rewrite(raw_dataset, model, tokenizer):
+def rewrite(raw_dataset, model, tokenizer, accelerator):
     tokenized_instructions = tokenizer(
         list(raw_dataset["instruction"]),
         padding=True,
@@ -79,18 +80,36 @@ def rewrite(raw_dataset, model, tokenizer):
         max_length=MAX_LENGTH,
         return_tensors="pt",
     )
+
+    total = len(tokenized_instructions["input_ids"])
+    per_device = total // accelerator.num_processes
+    start = accelerator.process_index * per_device
+    end = (
+        total
+        if accelerator.process_index == accelerator.num_processes - 1
+        else (start + per_device)
+    )
+
+    # only process this slice
+    slice_input_ids = tokenized_instructions["input_ids"][start:end]
+    slice_mask = tokenized_instructions["attention_mask"][start:end]
+    slice_instruction = raw_dataset["instruction"][start:end]
+    slice_prompt = raw_dataset["prompt"][start:end]
+    unwrapped_model = accelerator.unwrap_model(model)
+    unwrapped_model.to(accelerator.device)
+
     outputs = []
     print("*** Generating Output ***")
     for t, mask in tqdm(
         zip(
-            tokenized_instructions["input_ids"],
-            tokenized_instructions["attention_mask"],
+            slice_input_ids,
+            slice_mask,
         ),
-        total=len(tokenized_instructions["input_ids"]),
+        total=end - start,
     ):
-        t = t.unsqueeze(0).to("cuda")
-        mask = mask.unsqueeze(0).to("cuda")
-        output = model.generate(
+        t = t.unsqueeze(0).to(accelerator.device)
+        mask = mask.unsqueeze(0).to(accelerator.device)
+        output = unwrapped_model.generate(
             input_ids=t,
             attention_mask=mask,
             max_new_tokens=128,
@@ -101,27 +120,22 @@ def rewrite(raw_dataset, model, tokenizer):
         )
         for out in output:
             outputs.append(out[len(t[0]) :])
-
     outputs = tokenizer.batch_decode(outputs, skip_special_tokens=True)
-    n = len(raw_dataset["instruction"])
-    preference = {}
-    preference["prompt"] = []
-    preference["chosen"] = []
-    preference["rejected"] = []
-    score = 0
+    preferences = []
+    scores = []
     print("*** Judging Output ***")
-    move_model_to_device()
-    for i in tqdm(range(n)):
+    move_model_to_device(accelerator.device)
+    for i in tqdm(range(end - start)):
         result = []
         for j in range(8):
-            res = judge(outputs[i * 8 + j], raw_dataset["prompt"][i])
+            res = judge(outputs[i * 8 + j], slice_prompt[i])
             outputs[i * 8 + j]
-            res["prompt"] = raw_dataset["instruction"][i]
+            res["prompt"] = slice_instruction[i]
             res["rewrite"] = outputs[i * 8 + j]
             with open("out.tmp", "a", encoding="utf-8") as f:
                 f.write(json.dumps(res, ensure_ascii=False) + "\n")
             result.append(res)
-            score += res["safety_score"] * res["relevance_score"]
+            scores.append(res["safety_score"] * res["relevance_score"])
         for j in range(7):
             score1 = result[j]["safety_score"] * result[j]["relevance_score"]
             for k in range(j, 8):
@@ -129,15 +143,25 @@ def rewrite(raw_dataset, model, tokenizer):
                 if score1 == score2:
                     continue
                 elif score1 < score2:
-                    preference["prompt"].append(raw_dataset["instruction"][i])
-                    preference["chosen"].append(outputs[i * 8 + k])
-                    preference["rejected"].append(outputs[i * 8 + j])
+                    preferences.append(
+                        {
+                            "prompt": slice_instruction[i],
+                            "chosen": outputs[i * 8 + k],
+                            "rejected": outputs[i * 8 + j],
+                        }
+                    )
                 else:
-                    preference["prompt"].append(raw_dataset["instruction"][i])
-                    preference["chosen"].append(outputs[i * 8 + j])
-                    preference["rejected"].append(outputs[i * 8 + k])
+                    preferences.append(
+                        {
+                            "prompt": slice_instruction[i],
+                            "chosen": outputs[i * 8 + j],
+                            "rejected": outputs[i * 8 + k],
+                        }
+                    )
     move_model_to_host()
-    return preference, score / (8 * n)
+    gathered_preferences = gather_object(preferences)
+    gathered_scores = gather_object(scores)
+    return gathered_preferences, gathered_scores
 
 
 def main(args):
@@ -156,8 +180,8 @@ def main(args):
         tokenizer.bos_token_id = tokenizer.eos_token_id
 
     model = AutoModelForCausalLM.from_pretrained(REWRITE_MODEL, dtype=torch.bfloat16)
-    if accelerator.is_main_process:
-        initialize_models(SAFETY_MODEL, USEFULNESS_MODEL, CHAT_MODEL)
+    initialize_models(SAFETY_MODEL, USEFULNESS_MODEL, CHAT_MODEL)
+    move_model_to_host()
     accelerator.wait_for_everyone()
     model = accelerator.prepare(model)
 
@@ -171,15 +195,14 @@ def main(args):
         prompts.append(get_prompt(raw_dataset["prompt"][i]))
     raw_dataset = raw_dataset.add_column("instruction", prompts)
 
-    scores = []
+    score_history = []
     patience = 0
     for it in range(train_args["iteration"]):
+        preferences, scores = rewrite(raw_dataset, model, tokenizer, accelerator)
+        score = sum(scores) / (n * 8)
         if accelerator.is_main_process:
-            rewrite_dataset, score = rewrite(
-                raw_dataset, accelerator.unwrap_model(model), tokenizer
-            )
             with open("data/tmp.json", "w", encoding="utf-8") as f:
-                json.dump(rewrite_dataset, f, ensure_ascii=False, indent=4)
+                json.dump(preferences, f, ensure_ascii=False, indent=4)
             tokenizer.save_pretrained(train_args["output_dir"])
             logger.info(json.dumps({"average score": score}, indent=4))
             with open(
@@ -189,9 +212,7 @@ def main(args):
                 json.dump({"average score": score}, f, indent=4)
         accelerator.wait_for_everyone()
 
-        model = train(accelerator.unwrap_model(model), tokenizer, accelerator, args, it)
-
-        if len(scores) != 0 and score < max(scores):
+        if len(score_history) != 0 and score < max(score_history):
             patience += 1
         else:
             accelerator.wait_for_everyone()
@@ -206,9 +227,11 @@ def main(args):
                 is_main_process=accelerator.is_main_process,
                 save_function=accelerator.save,
             )
-
+        score_history.append(score)
         if patience >= train_args["patience"]:
             break
+
+        model = train(accelerator.unwrap_model(model), tokenizer, accelerator, args, it)
 
 
 def train(model, tokenizer, accelerator, args, it):
@@ -217,7 +240,7 @@ def train(model, tokenizer, accelerator, args, it):
 
     with open("data/tmp.json", "r", encoding="utf-8") as f:
         rewrite = json.load(f)
-    rewrite_dataset = Dataset.from_dict(rewrite).train_test_split(test_size=0.1)
+    rewrite_dataset = Dataset.from_list(rewrite).train_test_split(test_size=0.1)
     train_dataset = rewrite_dataset["train"]
     test_dataset = rewrite_dataset["test"]
 

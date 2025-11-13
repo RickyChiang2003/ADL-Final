@@ -209,7 +209,7 @@ def move_model_to_host():
     relevance_model.to("cpu")
 
 
-def move_model_to_device():
+def move_model_to_device(device):
     global guard_model, relevance_model, chatlm_model
     chatlm_model.to(device)
     guard_model.to(device)
