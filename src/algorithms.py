@@ -14,7 +14,7 @@ def evaluate_rewrite(toxic_prompt: str) -> str:
 
 
 def algorithm_1(toxic_prompt: str) -> str:
-    REWRITE_MODEL = "checkpoints/exp1"
+    REWRITE_MODEL = "models/rewrite"
     MAX_LENGTH = 2048
     model = AutoModelForCausalLM.from_pretrained(
         REWRITE_MODEL, dtype=torch.bfloat16, device_map="cuda"

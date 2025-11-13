@@ -7,15 +7,14 @@ import datasets
 import torch
 import transformers
 from accelerate import Accelerator
-from accelerate.utils import gather_object
 from accelerate.logging import get_logger
-from accelerate.utils import set_seed
+from accelerate.utils import broadcast_object_list, gather_object, set_seed
 from datasets import Dataset
 from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, EarlyStoppingCallback
 from trl import DPOConfig, DPOTrainer
 
-from eval import initialize_models, judge, move_model_to_host, move_model_to_device
+from eval import initialize_models, judge, move_model_to_device, move_model_to_host
 from utils import (
     get_dataset,
     get_next_run_dir,
@@ -24,7 +23,6 @@ from utils import (
     sanitize_config,
 )
 
-REWRITE_MODEL = "models/rewrite"
 SAFETY_MODEL = "models/guard"
 USEFULNESS_MODEL = "models/usefulness"
 CHAT_MODEL = "models/chat"
@@ -69,6 +67,13 @@ def accelerator_setup(train_args, isTest):
             base_dir=train_args["logs_dir"], prefix=prefix
         )
     accelerator.wait_for_everyone()
+    train_args["output_dir"] = broadcast_object_list(
+        [train_args["output_dir"]], from_process=0
+    )[0]
+    train_args["logs_dir"] = broadcast_object_list(
+        [train_args["logs_dir"]], from_process=0
+    )[0]
+    print(train_args["output_dir"])
     return accelerator
 
 
@@ -167,19 +172,22 @@ def rewrite(raw_dataset, model, tokenizer, accelerator):
 def main(args):
     # initialize configuration
     train_args = args["train"]
+    model_args = args["model"]
     set_seed(args["seed"])
 
     # get accelerator
     accelerator = accelerator_setup(train_args, isTest=False)
 
     # initialize tokenizer and model
-    tokenizer = AutoTokenizer.from_pretrained(REWRITE_MODEL)
+    tokenizer = AutoTokenizer.from_pretrained(model_args["name"])
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
     if tokenizer.bos_token_id is None:
         tokenizer.bos_token_id = tokenizer.eos_token_id
 
-    model = AutoModelForCausalLM.from_pretrained(REWRITE_MODEL, dtype=torch.bfloat16)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_args["name"], dtype=torch.bfloat16
+    )
     initialize_models(SAFETY_MODEL, USEFULNESS_MODEL, CHAT_MODEL)
     move_model_to_host()
     accelerator.wait_for_everyone()
