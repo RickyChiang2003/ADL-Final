@@ -1,7 +1,7 @@
 import os
 import argparse
 import json
-from src.eval import judge, initialize_models
+from src.eval_no_warning import judge, initialize_models
 from typing import List, Dict, Any
 from datasets import load_dataset, Dataset
 import sys
