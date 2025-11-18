@@ -101,26 +101,23 @@ def rewrite(raw_dataset, model, tokenizer, accelerator):
 
     outputs = []
     print("*** Generating Output ***")
-    for t, mask in tqdm(
-        zip(
-            slice_input_ids,
-            slice_mask,
-        ),
-        total=end - start,
-    ):
-        t = t.unsqueeze(0).to(accelerator.device)
-        mask = mask.unsqueeze(0).to(accelerator.device)
+    slice_input_ids = slice_input_ids.to(accelerator.device)
+    slice_mask = slice_mask.to(accelerator.device)
+
+    for i in tqdm(range(0, end - start, batch_size), total=(end - start) // batch_size):
         output = unwrapped_model.generate(
-            input_ids=t,
-            attention_mask=mask,
+            input_ids=slice_input_ids[i:i+batch_size],
+            attention_mask=slice_mask[i:i+batch_size],
             max_new_tokens=256,
             do_sample=True,
             top_k=50,
             top_p=0.95,
             num_return_sequences=8,
         )
+
         for out in output:
-            outputs.append(out[len(t[0]) :])
+            outputs.append(out[len(slice_input_ids[0]) :])
+
     outputs = tokenizer.batch_decode(outputs, skip_special_tokens=True)
     preferences = []
     scores = []
