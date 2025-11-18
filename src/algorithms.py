@@ -37,7 +37,7 @@ def algorithm_1(toxic_prompt: str) -> str:
     output = model.generate(
         input_ids=t,
         attention_mask=mask,
-        max_new_tokens=128,
+        max_new_tokens=256,
         do_sample=True,
         top_k=50,
         top_p=0.95,

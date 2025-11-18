@@ -2,11 +2,12 @@ import argparse
 import json
 import logging
 import os
+from datetime import timedelta
 
 import datasets
 import torch
 import transformers
-from accelerate import Accelerator
+from accelerate import Accelerator, InitProcessGroupKwargs
 from accelerate.logging import get_logger
 from accelerate.utils import broadcast_object_list, gather_object, set_seed
 from datasets import Dataset
@@ -27,24 +28,20 @@ SAFETY_MODEL = "models/guard"
 USEFULNESS_MODEL = "models/usefulness"
 CHAT_MODEL = "models/chat"
 MAX_LENGTH = 2048
+PREFERENCE_FILE = "data/preferences.json"
 
 logger = get_logger(__name__)
 
 
-def accelerator_setup(train_args, isTest):
-    # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
-    # If we're using tracking, we also need to initialize it here and it will by default pick up all supported trackers
-    # in the environment
-    if not isTest:
-        accelerator = Accelerator(
-            log_with="all",
-            project_dir=train_args["logs_dir"],
-            gradient_accumulation_steps=train_args["gradient_accumulation_steps"],
-        )
-    else:
-        accelerator = Accelerator()
+def accelerator_setup(train_args):
+    kwargs = InitProcessGroupKwargs(backend="nccl", timeout=timedelta(seconds=5000))
+    accelerator = Accelerator(
+        log_with="all",
+        project_dir=train_args["logs_dir"],
+        kwargs_handlers=[kwargs],
+        gradient_accumulation_steps=train_args["gradient_accumulation_steps"],
+    )
 
-    # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
@@ -58,7 +55,7 @@ def accelerator_setup(train_args, isTest):
         datasets.utils.logging.set_verbosity_error()
         transformers.utils.logging.set_verbosity_error()
 
-    if accelerator.is_main_process and not isTest:
+    if accelerator.is_main_process:
         prefix = "debug" if train_args["debug"] else "exp"
         train_args["output_dir"] = get_next_run_dir(
             base_dir=train_args["output_dir"], prefix=prefix
@@ -73,7 +70,6 @@ def accelerator_setup(train_args, isTest):
     train_args["logs_dir"] = broadcast_object_list(
         [train_args["logs_dir"]], from_process=0
     )[0]
-    print(train_args["output_dir"])
     return accelerator
 
 
@@ -117,7 +113,7 @@ def rewrite(raw_dataset, model, tokenizer, accelerator):
         output = unwrapped_model.generate(
             input_ids=t,
             attention_mask=mask,
-            max_new_tokens=128,
+            max_new_tokens=256,
             do_sample=True,
             top_k=50,
             top_p=0.95,
@@ -176,7 +172,7 @@ def main(args):
     set_seed(args["seed"])
 
     # get accelerator
-    accelerator = accelerator_setup(train_args, isTest=False)
+    accelerator = accelerator_setup(train_args)
 
     # initialize tokenizer and model
     tokenizer = AutoTokenizer.from_pretrained(model_args["name"])
@@ -209,7 +205,7 @@ def main(args):
         preferences, scores = rewrite(raw_dataset, model, tokenizer, accelerator)
         score = sum(scores) / (n * 8)
         if accelerator.is_main_process:
-            with open("data/tmp.json", "w", encoding="utf-8") as f:
+            with open(PREFERENCE_FILE, "w", encoding="utf-8") as f:
                 json.dump(preferences, f, ensure_ascii=False, indent=4)
             tokenizer.save_pretrained(train_args["output_dir"])
             logger.info(json.dumps({"average score": score}, indent=4))
@@ -223,7 +219,7 @@ def main(args):
         if len(score_history) != 0 and score < max(score_history):
             patience += 1
         else:
-            accelerator.wait_for_everyone()
+            patience = 0
             unwrapped_model = accelerator.unwrap_model(model)
             state_dict = {
                 k: v.contiguous() if isinstance(v, torch.Tensor) else v
@@ -246,7 +242,7 @@ def train(model, tokenizer, accelerator, args, it):
     data_args = args["data"]
     train_args = args["train"]
 
-    with open("data/tmp.json", "r", encoding="utf-8") as f:
+    with open(PREFERENCE_FILE, "r", encoding="utf-8") as f:
         rewrite = json.load(f)
     rewrite_dataset = Dataset.from_list(rewrite).train_test_split(test_size=0.1)
     train_dataset = rewrite_dataset["train"]
@@ -274,7 +270,9 @@ def train(model, tokenizer, accelerator, args, it):
         logging_dir=os.path.join(train_args["logs_dir"], f"iteration_{it}"),
         load_best_model_at_end=True,
     )
-    callbacks = [EarlyStoppingCallback(early_stopping_patience=train_args["patience"])]
+    callbacks = [
+        EarlyStoppingCallback(early_stopping_patience=train_args["train_patience"])
+    ]
     trainer = DPOTrainer(
         model=model,
         args=dpo_args,
