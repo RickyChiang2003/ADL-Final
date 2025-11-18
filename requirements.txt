@@ -6,3 +6,5 @@ accelerate==1.10.1
 gdown
 datasets==4.0.0
 tqdm==4.67.1
+bitsandbytes
+peft>=0.7.0

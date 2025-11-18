@@ -4,6 +4,7 @@ import json
 from src.eval import judge, initialize_models
 from typing import List, Dict, Any
 from datasets import load_dataset, Dataset
+from tqdm import tqdm
 import sys
 
 # --- Configuration ---
@@ -253,9 +254,10 @@ def main():
             print(f"Warning: Could not parse existing JSONL file to resume: {e}")
     
     print(f"Resuming processing (skipping {len(processed_ids)} items already completed).")
-    
-    # 4. Main Loop
-    for index, record in enumerate(ds):
+
+    # 4. Main Loop with tqdm progress bar
+    pbar = tqdm(enumerate(ds), total=total, desc="Evaluating prompts", unit="prompt")
+    for index, record in pbar:
         # Skip already processed samples
         rec_id = record.get('id', index)
         if rec_id in processed_ids:
@@ -264,8 +266,8 @@ def main():
         toxic_prompt = record['prompt']
         cost = record.get('cost', None)
         # Get the corresponding rewritten prompt
-        rewritten_prompt = rewritten_prompts[index] 
-        
+        rewritten_prompt = rewritten_prompts[index]
+
         eval_result = judge(rewritten_prompt, toxic_prompt)
 
         result_dict = {
@@ -285,9 +287,11 @@ def main():
         except Exception as e:
             print(f"Error writing record {rec_id} to JSONL: {e}")
 
-        # Periodic progress
-        if (index + 1) % 10 == 0 or index == total - 1 or len(processed_ids) == 0:
-            print(f"Processed {index + 1} / {total} prompts...")
+        # Update progress bar with current scores
+        pbar.set_postfix({
+            'safety': f"{eval_result['safety_score']:.2f}",
+            'relevance': f"{eval_result['relevance_score']:.2f}"
+        })
 
     print(f"\nEvaluation complete. Results saved incrementally to: {EVAL_FILE}")
 

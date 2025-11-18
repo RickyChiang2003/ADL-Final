@@ -4,6 +4,7 @@ import json
 from src.agent import PromptSafetyAgent
 from typing import List, Dict, Any
 from datasets import load_dataset, Dataset
+from tqdm import tqdm
 import sys
 
 # --- Configuration ---
@@ -116,15 +117,18 @@ def main():
             print(f"Warning: Could not parse existing JSONL file to resume: {e}")
     
     print(f"Resuming processing from index {start_index}/{total} (skipping {start_index} items already completed).")
-    
+
     try:
         # Use 'a' (append) mode for resilient, incremental writing
         with open(INFERENCE_FILE, 'a', encoding='utf-8') as f:
-            for index, record in enumerate(ds):
+            # Create progress bar
+            pbar = tqdm(enumerate(ds), total=total, desc="Rewriting prompts", unit="prompt", initial=start_index)
+
+            for index, record in pbar:
                 # Skip already processed samples
                 if index < start_index:
                     continue
-                
+
                 toxic_prompt = record['prompt']
                 rewritten_prompt = agent.rewrite(toxic_prompt)
 
@@ -135,9 +139,11 @@ def main():
                     rec_id = record.get('id', index)
                     print(f"Error writing record {rec_id} to JSONL: {e}")
 
-                # Periodic progress
-                if (index + 1) % 10 == 0 or index == total - 1:
-                    print(f"Processed {index + 1} / {total} prompts...")
+                # Update progress bar with prompt length info
+                pbar.set_postfix({
+                    'orig_len': len(toxic_prompt),
+                    'new_len': len(rewritten_prompt)
+                })
 
     except KeyboardInterrupt:
         print("\nInference interrupted. Results saved up to the last completed item.")

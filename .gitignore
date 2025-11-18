@@ -4,3 +4,6 @@ models/*
 !models/.gitkeep
 results/*
 !results/.gitkeep
+*.md
+!README.md
+log*

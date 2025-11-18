@@ -169,3 +169,23 @@ python scripts/train_trigger.py \
   "weighted_final_acc": 0.16484517,
   "total_weight": 1647
 }
+
+
+# 1. 安裝依賴
+pip install peft>=0.7.0
+
+# 2. 訓練 rewriter (30-45 分鐘)
+CUDA_VISIBLE_DEVICES=0,1 python scripts/train_rewriter.py \
+  --data theblackcat102/ADL_Final_25W_part1_with_cost \
+  --num-train-samples 50 \
+  --num-epochs 3 \
+  --cache-unsafe-prompts cache/unsafe_prompts.json \
+  --output models/rewriter_lora
+
+# 3. 測試效果
+python run_inference.py --algorithm algorithm_with_rewriter
+python run_eval.py --algorithm algorithm_with_rewriter
+
+# 4. 如果滿意，evaluate_rewrite 會自動使用 rewriter
+python run_inference.py --algorithm evaluate_rewrite
+python run_eval.py --algorithm evaluate_rewrite
