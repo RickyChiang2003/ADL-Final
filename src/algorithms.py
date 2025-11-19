@@ -10,10 +10,10 @@ def evaluate_rewrite(toxic_prompt: str) -> str:
     [MANDATORY] This is the final, official algorithm entry point.
     It will be run if no --algorithm flag is specified in main.py.
     """
-    return algorithm_1(toxic_prompt)
+    return dpo(toxic_prompt)
 
 
-def algorithm_1(toxic_prompt: str) -> str:
+def dpo(toxic_prompt: str) -> str:
     REWRITE_MODEL = "models/rewrite"
     MAX_LENGTH = 2048
     model = AutoModelForCausalLM.from_pretrained(
@@ -45,3 +45,7 @@ def algorithm_1(toxic_prompt: str) -> str:
     output = output[0][len(t[0]) :]
     output = tokenizer.decode(output, skip_special_tokens=True)
     return output
+
+
+def dpo_with_reward(toxic_prompt: str) -> str:
+    raise NotImplementedError
