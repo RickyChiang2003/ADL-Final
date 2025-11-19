@@ -15,7 +15,12 @@ from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, EarlyStoppingCallback
 from trl import DPOConfig, DPOTrainer
 
-from eval import initialize_models, judge, move_model_to_device, move_model_to_host
+from eval_no_warning import (
+    initialize_models,
+    judge,
+    move_model_to_device,
+    move_model_to_host,
+)
 from utils import (
     get_dataset,
     get_next_run_dir,
@@ -289,7 +294,7 @@ def train(model, tokenizer, accelerator, args, it):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--config", help="the path of the config file", default="config.json"
+        "--config", help="the path of the config file", default="config/train.json"
     )
     args = parser.parse_args()
     config = load_config(args.config)

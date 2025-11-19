@@ -16,10 +16,9 @@ from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
     EarlyStoppingCallback,
-    TrainerArguments,
     Trainer,
+    TrainerArguments,
 )
-
 
 from eval_no_warning import (
     initialize_models,
@@ -201,10 +200,10 @@ def main(args):
             json.dump({"average score": score}, f, indent=4)
 
     accelerator.wait_for_everyone()
-    train(accelerator.unwrap_model(model), tokenizer, accelerator, args)
+    train(accelerator.unwrap_model(model), accelerator, args)
 
 
-def train(model, tokenizer, accelerator, args):
+def train(model, accelerator, args):
     data_args = args["data"]
     train_args = args["train"]
 
@@ -250,7 +249,7 @@ def train(model, tokenizer, accelerator, args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--config", help="the path of the config file", default="config.json"
+        "--config", help="the path of the config file", default="config/reward.json"
     )
     args = parser.parse_args()
     config = load_config(args.config)
