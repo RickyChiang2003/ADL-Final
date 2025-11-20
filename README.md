@@ -54,4 +54,17 @@ python run_eval.py
 ```
 
 
+# Reward model
+
+## 訓練
+
+將前面得到 rewrite model 放到 `models/rewrite` 下，並且執行：
+```bash
+accelerate launch --num_processes 4 src/sampler.py [--debug]
+accelerate launch --num_processes 4 src/train.py [--config config/reward.json]
+```
+
+`src/sampler.py` 只需要執行一次即可。
+
+
 
