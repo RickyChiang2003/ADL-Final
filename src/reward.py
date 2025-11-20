@@ -13,11 +13,12 @@ from accelerate.utils import broadcast_object_list, gather_object, set_seed
 from datasets import Dataset
 from tqdm.auto import tqdm
 from transformers import (
+    AutoModelForCausalLM,
     AutoModelForSequenceClassification,
     AutoTokenizer,
     EarlyStoppingCallback,
     Trainer,
-    TrainerArguments,
+    TrainingArguments,
 )
 
 from eval_no_warning import (
@@ -37,6 +38,7 @@ from utils import (
 SAFETY_MODEL = "models/guard"
 USEFULNESS_MODEL = "models/usefulness"
 CHAT_MODEL = "models/chat"
+REWRITE_MODEL = "models/rewrite"
 MAX_LENGTH = 2048
 RESULT_FILE = "data/results.json"
 
@@ -84,97 +86,22 @@ def accelerator_setup(train_args):
     return accelerator
 
 
-def rewrite(raw_dataset, model, tokenizer, accelerator):
-    tokenized_instructions = tokenizer(
-        list(raw_dataset["instruction"]),
-        padding=True,
-        truncation=True,
-        max_length=MAX_LENGTH,
-        return_tensors="pt",
-    )
-
-    total = len(tokenized_instructions["input_ids"])
-    per_device = total // accelerator.num_processes
-    start = accelerator.process_index * per_device
-    end = (
-        total
-        if accelerator.process_index == accelerator.num_processes - 1
-        else (start + per_device)
-    )
-
-    # only process this slice
-    slice_input_ids = tokenized_instructions["input_ids"][start:end]
-    slice_mask = tokenized_instructions["attention_mask"][start:end]
-    slice_instruction = raw_dataset["instruction"][start:end]
-    slice_prompt = raw_dataset["prompt"][start:end]
-    unwrapped_model = accelerator.unwrap_model(model)
-    unwrapped_model.to(accelerator.device)
-
-    outputs = []
-    print("*** Generating Output ***")
-    for t, mask in tqdm(
-        zip(
-            slice_input_ids,
-            slice_mask,
-        ),
-        total=end - start,
-    ):
-        t = t.unsqueeze(0).to(accelerator.device)
-        mask = mask.unsqueeze(0).to(accelerator.device)
-        with torch.no_grad():
-            output = unwrapped_model.generate(
-                input_ids=t,
-                attention_mask=mask,
-                max_new_tokens=256,
-                do_sample=True,
-                top_k=50,
-                top_p=0.95,
-                num_return_sequences=16,
-            )
-        for out in output:
-            outputs.append(out[len(t[0]) :])
-    outputs = tokenizer.batch_decode(outputs, skip_special_tokens=True)
-    scores = []
-    results = []
-    print("*** Judging Output ***")
-    move_model_to_device(accelerator.device)
-    for i in tqdm(range(end - start)):
-        for j in range(8):
-            res = judge(outputs[i * 8 + j], slice_prompt[i])
-            outputs[i * 8 + j]
-            res["prompt"] = slice_instruction[i]
-            res["rewrite"] = outputs[i * 8 + j]
-            res["score"] = res["safety_score"] * res["relevance_score"]
-            results.append(res)
-            scores.append(res["score"])
-    move_model_to_host()
-    gathered_results = gather_object(results)
-    gathered_scores = gather_object(scores)
-    return gathered_results, gathered_scores
-
-
 def main(args):
-    # initialize configuration
     train_args = args["train"]
     model_args = args["model"]
     set_seed(args["seed"])
-
-    # get accelerator
     accelerator = accelerator_setup(train_args)
 
-    # initialize tokenizer and model
     tokenizer = AutoTokenizer.from_pretrained(model_args["name"])
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
     if tokenizer.bos_token_id is None:
         tokenizer.bos_token_id = tokenizer.eos_token_id
-
     model = AutoModelForSequenceClassification.from_pretrained(
-        model_args["name"], dtype=torch.bfloat16
+        model_args["name"],
+        dtype=torch.bfloat16,
+        num_labels=2,
     )
-    initialize_models(SAFETY_MODEL, USEFULNESS_MODEL, CHAT_MODEL)
-    move_model_to_host()
-    accelerator.wait_for_everyone()
     model = accelerator.prepare(model)
 
     raw_dataset = get_dataset(args["data"])["train"]
@@ -187,37 +114,63 @@ def main(args):
         prompts.append(get_prompt(raw_dataset["prompt"][i]))
     raw_dataset = raw_dataset.add_column("instruction", prompts)
 
-    results, scores = rewrite(raw_dataset, model, tokenizer, accelerator)
-    score = sum(scores) / (n * 8)
-    if accelerator.is_main_process:
-        with open(RESULT_FILE, "w", encoding="utf-8") as f:
-            json.dump(results, f, ensure_ascii=False, indent=4)
-        logger.info(json.dumps({"average score": score}, indent=4))
-        with open(
-            os.path.join(train_args["output_dir"], "all_result.json"),
-            "a",
-        ) as f:
-            json.dump({"average score": score}, f, indent=4)
-
-    accelerator.wait_for_everyone()
-    train(accelerator.unwrap_model(model), accelerator, args)
+    rewrite_tokenizer = AutoTokenizer.from_pretrained(REWRITE_MODEL)
+    if rewrite_tokenizer.pad_token_id is None:
+        rewrite_tokenizer.pad_token_id = rewrite_tokenizer.eos_token_id
+    if rewrite_tokenizer.bos_token_id is None:
+        rewrite_tokenizer.bos_token_id = rewrite_tokenizer.eos_token_id
+    rewrite_model = AutoModelForCausalLM.from_pretrained(REWRITE_MODEL)
+    rewrite_model = accelerator.prepare(rewrite_model)
+    train(accelerator.unwrap_model(model), tokenizer, accelerator, args)
 
 
-def train(model, accelerator, args):
+def train(model, tokenizer, accelerator, args):
     data_args = args["data"]
     train_args = args["train"]
 
     with open(RESULT_FILE, "r", encoding="utf-8") as f:
         results = json.load(f)
     rewrite_dataset = Dataset.from_list(results).train_test_split(test_size=0.1)
-    train_dataset = rewrite_dataset["train"]
-    test_dataset = rewrite_dataset["test"]
+
+    def preprocess_function(examples):
+        rewrite = examples["rewrite"]
+        labels = examples["score"]
+        tokenized_examples = tokenizer(
+            rewrite,
+            padding=True,
+            truncation=True,
+            max_length=MAX_LENGTH,
+            return_tensors="pt",
+        )
+        tokenized_examples["labels"] = [[1 - label, label] for label in labels]
+        print(tokenized_examples)
+        return tokenized_examples
+
+    remove_columns = [
+        "prompt",
+        "rewrite",
+        "chat_response",
+        "relevance_score",
+        "score",
+        "safety_score",
+    ]
+    with accelerator.main_process_first():
+        train_dataset = rewrite_dataset["train"].map(
+            preprocess_function,
+            batched=True,
+            remove_columns=remove_columns,
+        )
+        eval_dataset = rewrite_dataset["test"].map(
+            preprocess_function,
+            batched=True,
+            remove_columns=remove_columns,
+        )
     experiment_config = sanitize_config(args)
     accelerator.init_trackers(
         os.path.basename(train_args["logs_dir"]), experiment_config
     )
 
-    trainer_args = TrainerArguments(
+    trainer_args = TrainingArguments(
         output_dir=train_args["output_dir"],
         num_train_epochs=train_args["epochs"],
         gradient_accumulation_steps=train_args["gradient_accumulation_steps"],
@@ -239,7 +192,7 @@ def train(model, accelerator, args):
         model=model,
         args=trainer_args,
         train_dataset=train_dataset,
-        eval_dataset=test_dataset,
+        eval_dataset=eval_dataset,
         callbacks=callbacks,
     )
 
