@@ -118,7 +118,7 @@ def rewrite(raw_dataset, model, tokenizer, accelerator):
     print("*** Judging Output ***")
     move_model_to_device(accelerator.device)
     for i in tqdm(range(end - start)):
-        for j in range(8):
+        for j in range(16):
             res = judge(outputs[i * 8 + j], slice_prompt[i])
             outputs[i * 8 + j]
             res["prompt"] = slice_instruction[i]
@@ -159,7 +159,7 @@ def main(args):
     results, scores = rewrite(
         raw_dataset, rewrite_model, rewrite_tokenizer, accelerator
     )
-    score = sum(scores) / (n * 8)
+    score = sum(scores) / (n * 16)
     if accelerator.is_main_process:
         with open(RESULT_FILE, "w", encoding="utf-8") as f:
             json.dump(results, f, ensure_ascii=False, indent=4)
