@@ -6,3 +6,4 @@ results/*
 !results/.gitkeep
 id_ed25519.pub
 checkpoints/**
+src/_*.py
