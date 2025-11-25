@@ -19,11 +19,11 @@ from transformers import (
     EarlyStoppingCallback,
     Trainer,
     TrainingArguments,
+    DataCollatorWithPadding,
 )
 
 from eval_no_warning import (
     initialize_models,
-    judge,
     move_model_to_device,
     move_model_to_host,
 )
@@ -102,6 +102,7 @@ def main(args):
         dtype=torch.bfloat16,
         num_labels=2,
     )
+    model.config.pad_token_id = tokenizer.pad_token_id
     model = accelerator.prepare(model)
 
     raw_dataset = get_dataset(args["data"])["train"]
@@ -137,13 +138,13 @@ def train(model, tokenizer, accelerator, args):
         labels = examples["score"]
         tokenized_examples = tokenizer(
             rewrite,
-            padding=True,
+            #padding="max_length",
             truncation=True,
             max_length=MAX_LENGTH,
-            return_tensors="pt",
+            #return_tensors="pt",
         )
         tokenized_examples["labels"] = [[1 - label, label] for label in labels]
-        print(tokenized_examples)
+        #print(tokenized_examples)
         return tokenized_examples
 
     remove_columns = [
@@ -183,7 +184,8 @@ def train(model, tokenizer, accelerator, args):
         greater_is_better=False,
         save_strategy="best",
         save_total_limit=1,
-        logging_steps=train_args["check_val_every_n_step"] // 3,
+        #logging_steps=train_args["check_val_every_n_step"] // 3,
+        logging_steps=max(1, train_args["check_val_every_n_step"] // 3),
         logging_dir=train_args["logs_dir"],
         load_best_model_at_end=True,
     )
@@ -194,6 +196,7 @@ def train(model, tokenizer, accelerator, args):
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         callbacks=callbacks,
+        data_collator=DataCollatorWithPadding(tokenizer=tokenizer),
     )
 
     trainer.train()

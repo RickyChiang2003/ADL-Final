@@ -19,9 +19,9 @@ from transformers import (
 
 from eval_no_warning import (
     initialize_models,
-    judge,
     move_model_to_device,
     move_model_to_host,
+    batch_judge,
 )
 from utils import (
     get_dataset,
@@ -36,13 +36,14 @@ CHAT_MODEL = "models/chat"
 REWRITE_MODEL = "models/rewrite"
 MAX_LENGTH = 2048
 RESULT_FILE = "data/results.json"
+NUM_RETURN_SEQUENCES = 24
 
 
 logger = get_logger(__name__)
 
 
 def accelerator_setup():
-    kwargs = InitProcessGroupKwargs(backend="nccl", timeout=timedelta(seconds=5000))
+    kwargs = InitProcessGroupKwargs(backend="nccl", timeout=timedelta(seconds=50000))
     accelerator = Accelerator(
         log_with=None,
         kwargs_handlers=[kwargs],
@@ -88,6 +89,7 @@ def rewrite(raw_dataset, model, tokenizer, accelerator):
     slice_prompt = raw_dataset["prompt"][start:end]
     unwrapped_model = accelerator.unwrap_model(model)
     unwrapped_model.to(accelerator.device)
+    
 
     outputs = []
     print("*** Generating Output ***")
@@ -108,7 +110,7 @@ def rewrite(raw_dataset, model, tokenizer, accelerator):
                 do_sample=True,
                 top_k=50,
                 top_p=0.95,
-                num_return_sequences=16,
+                num_return_sequences=NUM_RETURN_SEQUENCES,
             )
         for out in output:
             outputs.append(out[len(t[0]) :])
@@ -117,20 +119,30 @@ def rewrite(raw_dataset, model, tokenizer, accelerator):
     results = []
     print("*** Judging Output ***")
     move_model_to_device(accelerator.device)
-    for i in tqdm(range(end - start)):
-        for j in range(16):
-            res = judge(outputs[i * 8 + j], slice_prompt[i])
-            outputs[i * 8 + j]
-            res["prompt"] = slice_instruction[i]
-            res["rewrite"] = outputs[i * 8 + j]
-            res["score"] = res["safety_score"] * res["relevance_score"]
-            results.append(res)
-            scores.append(res["score"])
-    move_model_to_host()
-    gathered_results = gather_object(results)
-    gathered_scores = gather_object(scores)
-    return gathered_results, gathered_scores
+    temp_file = f"data/results_rank_{accelerator.process_index}.jsonl"
+    if os.path.exists(temp_file):
+        os.remove(temp_file)
+        print(f"Rank {accelerator.process_index}: Removed existing temp file.")
 
+    for i in tqdm(range(end - start)):
+        start_idx = i * NUM_RETURN_SEQUENCES
+        end_idx = (i + 1) * NUM_RETURN_SEQUENCES
+        current_rewrites = outputs[start_idx : end_idx]
+        current_prompts = [slice_prompt[i]] * len(current_rewrites)
+        # (Batch Inference)
+        batch_results = batch_judge(current_rewrites, current_prompts)
+        for j, res in enumerate(batch_results):
+            res_obj = {
+                "prompt": slice_instruction[i],
+                "rewrite": current_rewrites[j],
+                "safety_score": res["safety_score"],
+                "relevance_score": res["relevance_score"],
+                "score": res["safety_score"] * res["relevance_score"],
+                "chat_response": res["chat_response"]
+            }
+            
+            with open(temp_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(res_obj, ensure_ascii=False) + "\n")
 
 def main(args):
     set_seed(args.seed)
@@ -156,14 +168,22 @@ def main(args):
         rewrite_tokenizer.bos_token_id = rewrite_tokenizer.eos_token_id
     rewrite_model = AutoModelForCausalLM.from_pretrained(REWRITE_MODEL)
     rewrite_model = accelerator.prepare(rewrite_model)
-    results, scores = rewrite(
+    rewrite(
         raw_dataset, rewrite_model, rewrite_tokenizer, accelerator
     )
-    score = sum(scores) / (n * 16)
     if accelerator.is_main_process:
+        all_data = []
+        for rank in range(accelerator.num_processes):
+            fname = f"data/results_rank_{rank}.jsonl"
+            if os.path.exists(fname):
+                with open(fname, "r", encoding="utf-8") as f:
+                    for line in f:
+                        if line.strip():
+                            all_data.append(json.loads(line))
+                # os.remove(fname)
         with open(RESULT_FILE, "w", encoding="utf-8") as f:
-            json.dump(results, f, ensure_ascii=False, indent=4)
-        logger.info(json.dumps({"average score": score}, indent=4))
+            json.dump(all_data, f, ensure_ascii=False, indent=4)
+        logger.info(f"Saved {len(all_data)} results to {RESULT_FILE}")
 
 
 if __name__ == "__main__":
