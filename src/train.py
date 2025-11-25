@@ -12,12 +12,12 @@ from accelerate.logging import get_logger
 from accelerate.utils import broadcast_object_list, gather_object, set_seed
 from datasets import Dataset
 from tqdm.auto import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer, EarlyStoppingCallback
+from transformers import AutoModelForCausalLM, AutoTokenizer, EarlyStoppingCallback, AutoModelForSequenceClassification
 from trl import DPOConfig, DPOTrainer
 
 from eval_no_warning import (
     initialize_models,
-    judge,
+    batch_judge,
     move_model_to_device,
     move_model_to_host,
 )
@@ -32,8 +32,11 @@ from utils import (
 SAFETY_MODEL = "models/guard"
 USEFULNESS_MODEL = "models/usefulness"
 CHAT_MODEL = "models/chat"
+#REWARD_CHECKPOINT = "reward_evalloss_067"
+#REWARD_BACKBONE = "Qwen/Qwen3-0.6B"
 MAX_LENGTH = 2048
 PREFERENCE_FILE = "data/preferences.json"
+NUM_RETURN_SEQUENCES = 8
 
 logger = get_logger(__name__)
 
@@ -105,69 +108,75 @@ def rewrite(raw_dataset, model, tokenizer, accelerator):
     unwrapped_model.to(accelerator.device)
 
     outputs = []
-    print("*** Generating Output ***")
-    for t, mask in tqdm(
-        zip(
-            slice_input_ids,
-            slice_mask,
-        ),
-        total=end - start,
-    ):
+    print(f"*** Generating Output (Rank {accelerator.process_index}) ***")
+    
+    for t, mask in tqdm(zip(slice_input_ids, slice_mask), total=end - start):
         t = t.unsqueeze(0).to(accelerator.device)
         mask = mask.unsqueeze(0).to(accelerator.device)
-        output = unwrapped_model.generate(
-            input_ids=t,
-            attention_mask=mask,
-            max_new_tokens=256,
-            do_sample=True,
-            top_k=50,
-            top_p=0.95,
-            num_return_sequences=8,
-        )
+        
+        with torch.no_grad():
+            output = unwrapped_model.generate(
+                input_ids=t,
+                attention_mask=mask,
+                max_new_tokens=256,
+                do_sample=True,
+                top_k=50,
+                top_p=0.95,
+                num_return_sequences=8, # 維持 8 個樣本以供比較
+            )
         for out in output:
             outputs.append(out[len(t[0]) :])
+            
     outputs = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+
     preferences = []
-    scores = []
-    print("*** Judging Output ***")
-    move_model_to_device(accelerator.device)
+    scores_history = []
+
+    print(f"*** Judging Output (Rank {accelerator.process_index}) ***")
+
     for i in tqdm(range(end - start)):
-        result = []
-        for j in range(8):
-            res = judge(outputs[i * 8 + j], slice_prompt[i])
-            outputs[i * 8 + j]
-            res["prompt"] = slice_instruction[i]
-            res["rewrite"] = outputs[i * 8 + j]
-            with open("out.tmp", "a", encoding="utf-8") as f:
-                f.write(json.dumps(res, ensure_ascii=False) + "\n")
-            result.append(res)
-            scores.append(res["safety_score"] * res["relevance_score"])
+        start_idx = i * 8 # 假設 num_return_sequences=8
+        end_idx = (i + 1) * 8
+        current_rewrites = outputs[start_idx : end_idx]
+        current_prompts = [slice_prompt[i]] * len(current_rewrites)
+
+        # 2. 呼叫 Batch Judge 
+        batch_results = batch_judge(current_rewrites, current_prompts)
+
+        # 3. 計算分數與構建 DPO Pairs
+        current_scores = []
+        for res in batch_results:
+            score = res["safety_score"] * res["relevance_score"]
+            current_scores.append(score)
+
+        scores_history.extend(current_scores)
+
         for j in range(7):
-            score1 = result[j]["safety_score"] * result[j]["relevance_score"]
+            score1 = current_scores[j]
             for k in range(j, 8):
-                score2 = result[k]["safety_score"] * result[k]["relevance_score"]
+                score2 = current_scores[k]
                 if score1 == score2:
                     continue
-                elif score1 < score2:
-                    preferences.append(
-                        {
-                            "prompt": slice_instruction[i],
-                            "chosen": outputs[i * 8 + k],
-                            "rejected": outputs[i * 8 + j],
-                        }
-                    )
+
+                if score1 < score2:
+                    preferences.append({
+                        "prompt": slice_instruction[i],
+                        "chosen": current_rewrites[k],
+                        "rejected": current_rewrites[j],
+                    })
                 else:
-                    preferences.append(
-                        {
-                            "prompt": slice_instruction[i],
-                            "chosen": outputs[i * 8 + j],
-                            "rejected": outputs[i * 8 + k],
-                        }
-                    )
-    move_model_to_host()
+                    preferences.append({
+                        "prompt": slice_instruction[i],
+                        "chosen": current_rewrites[j],
+                        "rejected": current_rewrites[k],
+                    })
+
     gathered_preferences = gather_object(preferences)
-    gathered_scores = gather_object(scores)
+    gathered_scores = gather_object(scores_history)
+
     return gathered_preferences, gathered_scores
+    
+
 
 
 def main(args):
@@ -190,7 +199,7 @@ def main(args):
         model_args["name"], dtype=torch.bfloat16
     )
     initialize_models(SAFETY_MODEL, USEFULNESS_MODEL, CHAT_MODEL)
-    move_model_to_host()
+    #move_model_to_host()
     accelerator.wait_for_everyone()
     model = accelerator.prepare(model)
 
