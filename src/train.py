@@ -37,7 +37,7 @@ CHAT_MODEL = "models/chat"
 MAX_LENGTH = 2048
 PREFERENCE_FILE = "data/preferences.json"
 NUM_RETURN_SEQUENCES = 8
-
+GENERATE_BATCH_SIZE = 8
 logger = get_logger(__name__)
 
 
@@ -110,14 +110,13 @@ def rewrite(raw_dataset, model, tokenizer, accelerator):
     outputs = []
     print(f"*** Generating Output (Rank {accelerator.process_index}) ***")
     
-    for t, mask in tqdm(zip(slice_input_ids, slice_mask), total=end - start):
-        t = t.unsqueeze(0).to(accelerator.device)
-        mask = mask.unsqueeze(0).to(accelerator.device)
-        
+    slice_input_ids = slice_input_ids.to(accelerator.device)
+    slice_mask = slice_mask.to(accelerator.device)
+    for i in tqdm(range(0, end-start, GENERATE_BATCH_SIZE), total = (end-start) // GENERATE_BATCH_SIZE):
         with torch.no_grad():
             output = unwrapped_model.generate(
-                input_ids=t,
-                attention_mask=mask,
+                input_ids=slice_input_ids[i:i+GENERATE_BATCH_SIZE],
+                attention_mask=slice_mask[i:i+GENERATE_BATCH_SIZE],
                 max_new_tokens=256,
                 do_sample=True,
                 top_k=50,
@@ -125,7 +124,7 @@ def rewrite(raw_dataset, model, tokenizer, accelerator):
                 num_return_sequences=8, # 維持 8 個樣本以供比較
             )
         for out in output:
-            outputs.append(out[len(t[0]) :])
+            outputs.append(out[len(slice_input_ids[0]) :])
             
     outputs = tokenizer.batch_decode(outputs, skip_special_tokens=True)
 
