@@ -28,10 +28,10 @@ hf download "theblackcat102/ADL_Final_25W_part1_with_cost" --repo-type dataset -
 下載資料後在 `data/` 底下找到對應的 `parquet` 檔 (`data/data/test-00000-of-00001.parquet`)，把路徑放到 `config/train.json` 的 `"data"` 底下的 `"file"` 欄位或移動直接該檔案。
 
 ## Drive Usage
-大型檔案如 checkpoints 或 results 請放在 [ **這裡** ](https://drive.google.com/drive/folders/1lGMseEGDRtiRAip4nqwmG6-fBkLTt0Ys?usp=sharing) 。已開啟編輯權限，注意請勿誤刪他人檔案。  
+大型檔案如 checkpoints 或 results 請放在 [ **這裡** ](https://drive.google.com/drive/folders/19QYdszxtU2e6rwlniNVtFS79at9zQJw-?usp=drive_link) 。已開啟編輯權限，注意請勿誤刪他人檔案。  
 檔案結構如下，請依格式修改檔名以方便閱讀：
 ```bash
-CVPDL FINAL/
+ADL FINAL/
 │
 ├── reward model/
 │   # rewriter score & sampler NUM_RETURN_SEQUENCES
